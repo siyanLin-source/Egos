@@ -12,7 +12,13 @@ export function MessageBubble({ message }: { message: UIMessage }) {
   }
 
   return (
-    <div className={cn("flex w-full", isUser ? "justify-end" : "justify-start")}>
+    <div
+      id={`message-${message.id}`}
+      className={cn(
+        "flex w-full scroll-mt-28",
+        isUser ? "justify-end" : "justify-start",
+      )}
+    >
       <div
         className={cn(
           "max-w-[82%] whitespace-pre-wrap rounded-3xl px-4 py-2.5 text-[15px] leading-6 shadow-sm sm:max-w-[68%]",

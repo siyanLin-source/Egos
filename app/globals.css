@@ -29,3 +29,19 @@ input,
 textarea {
   font: inherit;
 }
+
+[id^="message-"]:target > div {
+  outline: 3px solid rgba(37, 111, 91, 0.35);
+  outline-offset: 4px;
+  animation: message-target-pulse 1.8s ease-out 1;
+}
+
+@keyframes message-target-pulse {
+  0% {
+    outline-color: rgba(37, 111, 91, 0.8);
+  }
+
+  100% {
+    outline-color: rgba(37, 111, 91, 0.35);
+  }
+}

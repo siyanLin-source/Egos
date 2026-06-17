@@ -1,10 +1,28 @@
 import { type NextRequest, NextResponse } from "next/server";
-import { createServerClient } from "@supabase/ssr";
+import { createServerClient } from "@supabase/ssr/dist/module/createServerClient";
 
 export async function middleware(request: NextRequest) {
   let response = NextResponse.next({
     request,
   });
+  const isLoginPage = request.nextUrl.pathname.startsWith("/login");
+  const isHomePage = request.nextUrl.pathname === "/";
+  const hasAuthCookie = request.cookies
+    .getAll()
+    .some(
+      (cookie) =>
+        cookie.name.startsWith("sb-") && cookie.name.includes("auth-token"),
+    );
+
+  if (!hasAuthCookie) {
+    if (isHomePage) {
+      const url = request.nextUrl.clone();
+      url.pathname = "/login";
+      return NextResponse.redirect(url);
+    }
+
+    return response;
+  }
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -32,9 +50,6 @@ export async function middleware(request: NextRequest) {
   const {
     data: { user },
   } = await supabase.auth.getUser();
-
-  const isLoginPage = request.nextUrl.pathname.startsWith("/login");
-  const isHomePage = request.nextUrl.pathname === "/";
 
   if (!user && isHomePage) {
     const url = request.nextUrl.clone();

@@ -3,14 +3,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
+import Link from "next/link";
 
-import { CrisisResourceCard } from "@/components/chat/crisis-resource-card";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { MessageComposer } from "@/components/chat/message-composer";
-import {
-  containsCrisisSignal,
-  hasCrisisSignalInMessages,
-} from "@/lib/safety/crisis";
 import type { Message } from "@/lib/types";
 
 function toUiMessage(message: Message): UIMessage {
@@ -40,49 +36,13 @@ export function ChatView({
     () => initialMessages.map(toUiMessage),
     [initialMessages],
   );
-  const hasInitialCrisisSignal = useMemo(
-    () => hasCrisisSignalInMessages(initialUiMessages),
-    [initialUiMessages],
-  );
   const bottomRef = useRef<HTMLDivElement>(null);
   const transport = useMemo(() => new DefaultChatTransport({ api: "/api/chat" }), []);
   const { messages, sendMessage, status, stop, error } = useChat({
     messages: initialUiMessages,
     transport,
   });
-  const [showCrisisResources, setShowCrisisResources] = useState(
-    hasInitialCrisisSignal,
-  );
-  const [crisisResourcesCollapsed, setCrisisResourcesCollapsed] = useState(false);
   const isStreaming = status === "streaming" || status === "submitted";
-
-  useEffect(() => {
-    const storedShow = window.localStorage.getItem("egos-show-crisis-resources");
-    const storedCollapsed = window.localStorage.getItem(
-      "egos-crisis-resources-collapsed",
-    );
-
-    if (storedShow === "true" || hasInitialCrisisSignal) {
-      setShowCrisisResources(true);
-    }
-
-    if (storedCollapsed === "true") {
-      setCrisisResourcesCollapsed(true);
-    }
-  }, [hasInitialCrisisSignal]);
-
-  useEffect(() => {
-    if (showCrisisResources) {
-      window.localStorage.setItem("egos-show-crisis-resources", "true");
-    }
-  }, [showCrisisResources]);
-
-  useEffect(() => {
-    window.localStorage.setItem(
-      "egos-crisis-resources-collapsed",
-      crisisResourcesCollapsed ? "true" : "false",
-    );
-  }, [crisisResourcesCollapsed]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -97,19 +57,18 @@ export function ChatView({
             {userEmail ? userEmail : "已登录"}
           </p>
         </div>
-        <div className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-800">
-          在线
+        <div className="flex items-center gap-2">
+          <Link
+            href="/archive"
+            className="rounded-full bg-white px-3 py-1 text-xs font-medium text-neutral-700 ring-1 ring-neutral-200 transition hover:bg-neutral-50"
+          >
+            档案
+          </Link>
+          <div className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-800">
+            在线
+          </div>
         </div>
       </header>
-
-      {showCrisisResources ? (
-        <CrisisResourceCard
-          collapsed={crisisResourcesCollapsed}
-          onToggle={() =>
-            setCrisisResourcesCollapsed((currentValue) => !currentValue)
-          }
-        />
-      ) : null}
 
       <section className="flex-1 overflow-y-auto px-3 py-5 sm:px-6">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-3">
@@ -140,11 +99,6 @@ export function ChatView({
         disabled={status === "streaming" || status === "submitted"}
         isStreaming={isStreaming}
         onSend={(text) => {
-          if (containsCrisisSignal(text)) {
-            setShowCrisisResources(true);
-            setCrisisResourcesCollapsed(false);
-          }
-
           sendMessage({
             parts: [{ type: "text", text }],
           });

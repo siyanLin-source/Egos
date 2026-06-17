@@ -1,10 +1,13 @@
 import { convertToModelMessages, streamText, type UIMessage } from "ai";
+import { after } from "next/server";
 import { NextResponse } from "next/server";
 
 import { getAnthropicModel } from "@/lib/ai/anthropic";
+import { processArchiveAfterTurn } from "@/lib/archive/archive-event";
 import { SYSTEM_PROMPT } from "@/lib/ai/system-prompt";
-import { containsCrisisSignal, getUiMessageText } from "@/lib/safety/crisis";
+import { getUiMessageText } from "@/lib/safety/crisis";
 import { createClient } from "@/lib/supabase/server";
+import type { Message } from "@/lib/types";
 
 export const maxDuration = 30;
 export const runtime = "nodejs";
@@ -39,13 +42,17 @@ export async function POST(request: Request) {
     );
   }
 
-  const { error: userMessageError } = await supabase.from("messages").insert({
-    user_id: user.id,
-    sender: "user",
-    content: userText,
-  });
+  const { data: userMessage, error: userMessageError } = await supabase
+    .from("messages")
+    .insert({
+      user_id: user.id,
+      sender: "user",
+      content: userText,
+    })
+    .select("id,user_id,sender,content,image_url,created_at")
+    .single();
 
-  if (userMessageError) {
+  if (userMessageError || !userMessage) {
     return NextResponse.json(
       { error: "Could not save user message." },
       { status: 500 },
@@ -53,15 +60,10 @@ export async function POST(request: Request) {
   }
 
   const modelMessages = await convertToModelMessages(messages);
-  const hasCrisisSignal = containsCrisisSignal(userText);
 
   const result = streamText({
     model: getAnthropicModel(),
-    system: hasCrisisSignal
-      ? `${SYSTEM_PROMPT}
-
-本轮用户可能表达了自伤、自杀或活不下去的危机信号。请保持朋友口吻,不要变成机械稿。先认真接住 TA 的难受,温柔确认 TA 现在是否安全、是否身边有人可以立刻联系;如果 TA 有立即危险,鼓励 TA 现在就联系身边真人或拨打急救电话。不要自称心理咨询师或治疗师。`
-      : SYSTEM_PROMPT,
+    system: SYSTEM_PROMPT,
     messages: modelMessages,
   });
 
@@ -78,10 +80,33 @@ export async function POST(request: Request) {
         return;
       }
 
-      await supabase.from("messages").insert({
-        user_id: user.id,
-        sender: "ai",
-        content: assistantText,
+      const { data: assistantMessage, error: assistantMessageError } =
+        await supabase
+          .from("messages")
+          .insert({
+            user_id: user.id,
+            sender: "ai",
+            content: assistantText,
+          })
+          .select("id,user_id,sender,content,image_url,created_at")
+          .single();
+
+      if (assistantMessageError || !assistantMessage) {
+        console.error("Could not save assistant message.", assistantMessageError);
+        return;
+      }
+
+      after(async () => {
+        try {
+          await processArchiveAfterTurn({
+            supabase,
+            userId: user.id,
+            userMessage: userMessage as Message,
+            assistantMessage: assistantMessage as Message,
+          });
+        } catch (error) {
+          console.error("Archive processing failed.", error);
+        }
       });
     },
   });
