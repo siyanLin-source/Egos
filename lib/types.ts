@@ -3,6 +3,7 @@ export type MessageSender = "user" | "ai";
 export type Message = {
   id: string;
   user_id: string;
+  conversation_id: string;
   sender: MessageSender;
   content: string;
   image_url: string | null;
@@ -34,8 +35,58 @@ export type Entry = {
   places: string[];
   keywords: string[];
   message_ids: string[];
+  is_crisis: boolean;
   created_at: string;
   updated_at: string;
 };
 
 export type TopicType = "person" | "place" | "pet";
+
+export type TopicFact = {
+  text?: string;
+  source_entry_id?: string;
+  created_at?: string;
+};
+
+export type Topic = {
+  id: string;
+  user_id: string;
+  type: TopicType;
+  name: string;
+  first_mentioned_at: string;
+  last_mentioned_at: string;
+  mention_count: number;
+  facts: TopicFact[];
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProfileFactKind =
+  | "identity"
+  | "relationship"
+  | "pet"
+  | "interest"
+  | "preference"
+  | "routine"
+  | "goal"
+  | "health"
+  | "work"
+  | "school"
+  | "place"
+  | "other";
+
+export type ProfileFact = {
+  id: string;
+  user_id: string;
+  kind: ProfileFactKind;
+  subject: string;
+  text: string;
+  importance: number;
+  pinned: boolean;
+  source_entry_id: string | null;
+  source_message_ids: string[];
+  first_observed_at: string;
+  last_observed_at: string;
+  created_at: string;
+  updated_at: string;
+};

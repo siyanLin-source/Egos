@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --turbopack",
+    "dev:clean": "pkill -9 -f \"next dev\" || true; rm -rf .next; npm run dev -- -H 0.0.0.0 -p 3000",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -22,7 +23,7 @@
     "react": "^19.1.2",
     "react-dom": "^19.1.2",
     "tailwind-merge": "^3.6.0",
-    "undici": "^8.4.1",
+    "undici": "^7.28.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -33,6 +34,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "15.5.19",
+    "supabase": "^2.107.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

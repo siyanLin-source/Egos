@@ -18,6 +18,7 @@ export function MessageComposer({
   onStop: () => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   const [text, setText] = useState("");
   const canSend = text.trim().length > 0 && !disabled;
 
@@ -45,6 +46,19 @@ export function MessageComposer({
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const nativeEvent = event.nativeEvent as KeyboardEvent["nativeEvent"] & {
+      isComposing?: boolean;
+      keyCode?: number;
+    };
+    const isComposing =
+      isComposingRef.current ||
+      nativeEvent.isComposing === true ||
+      nativeEvent.keyCode === 229;
+
+    if (isComposing) {
+      return;
+    }
+
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       submit();
@@ -61,6 +75,12 @@ export function MessageComposer({
         aria-label="输入消息"
         className="max-h-36 min-h-11 resize-none rounded-3xl border-neutral-300 bg-white px-4 py-3 shadow-none"
         disabled={disabled}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
         onChange={(event) => setText(event.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="随便说点什么"

@@ -1,25 +1,29 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+import { proxyFetch } from "@/lib/ai/proxy-fetch";
 import {
   buildBoundaryPrompt,
   buildExtractionPrompt,
+} from "@/lib/archive/prompts";
+import {
   CATEGORIES,
   EMOTIONS,
-} from "@/lib/archive/prompts";
+  PROFILE_FACT_KINDS,
+} from "@/lib/archive/taxonomy";
+import {
+  normalizeProfileFacts,
+  type NormalizedProfileFact,
+  type RawProfileFact,
+} from "@/lib/archive/profile-facts";
 import type { Entry, Message } from "@/lib/types";
 
-type QueryResult<T> = PromiseLike<{ data: T | null; error: unknown }>;
-
-type ArchiveSupabaseClient = {
-  // Keep Supabase's deep generic query builder out of this module's public types.
-  from: (table: "messages") => any;
-  rpc: <T = unknown>(
-    name: string,
-    args: Record<string, unknown>,
-  ) => QueryResult<T>;
-};
+type ArchiveSupabaseClient = Pick<SupabaseClient, "from" | "rpc">;
 
 const IDLE_ARCHIVE_MS = Number(process.env.ARCHIVE_IDLE_MS ?? 5 * 60 * 1000);
-const AI_TIMEOUT_MS = Number(process.env.ARCHIVE_AI_TIMEOUT_MS ?? 10_000);
+const AI_TIMEOUT_MS = Number(process.env.ARCHIVE_AI_TIMEOUT_MS ?? 20_000);
 const MAX_EVENT_MESSAGES = 30;
+const MAX_DRAIN_ARCHIVE_BATCHES = 8;
+const MAX_DRAIN_STALL_RETRIES = 2;
 const IDLE_USER_BATCH_SIZE = 50;
 const EXPLICIT_END_SIGNALS = [
   "完",
@@ -47,6 +51,8 @@ const CONTROL_OR_FILLER_MESSAGES = [
 
 type BoundaryAction = "continue" | "new_event";
 
+type ExtractedProfileFact = NormalizedProfileFact;
+
 type ExtractedEntry = {
   summary: string;
   emotion: (typeof EMOTIONS)[number];
@@ -57,6 +63,8 @@ type ExtractedEntry = {
   pets: string[];
   keywords: string[];
   message_ids: string[];
+  is_crisis: boolean;
+  profile_facts: ExtractedProfileFact[];
   created_at: string;
 };
 
@@ -66,6 +74,108 @@ function normalizeList(values: string[]) {
   return Array.from(
     new Set(values.map((value) => value.trim()).filter(Boolean).slice(0, 12)),
   );
+}
+
+const PERSON_ALIASES: Record<string, string> = {
+  妈: "妈妈",
+  母亲: "妈妈",
+  男友: "男朋友",
+  女友: "女朋友",
+};
+
+const GENERIC_PERSON_ROLES = new Set([
+  "经理",
+  "主管",
+  "领导",
+  "老板",
+  "上司",
+]);
+
+function cleanEntityName(value: string) {
+  return value
+    .trim()
+    .replace(/^[""'']+|[""'']+$/g, "")
+    .replace(/[，,。.!！?？；;：:、]+$/g, "")
+    .trim();
+}
+
+function findActualCalledName(sourceText: string) {
+  return (
+    sourceText.match(/[\p{Script=Han}A-Za-z0-9]{1,8}总/u)?.[0] ??
+    sourceText.match(/[\p{Script=Han}A-Za-z0-9]{1,12}(?:老师|师傅)/u)?.[0] ??
+    null
+  );
+}
+
+function normalizePersonList(values: string[], sourceTexts: string[]) {
+  const sourceText = sourceTexts.join("\n");
+
+  return Array.from(
+    new Set(
+      values
+        .map((value) => {
+          const name = cleanEntityName(value);
+
+          if (!name) {
+            return "";
+          }
+
+          if (GENERIC_PERSON_ROLES.has(name)) {
+            return findActualCalledName(sourceText) ?? name;
+          }
+
+          return PERSON_ALIASES[name] ?? name;
+        })
+        .filter(Boolean)
+        .slice(0, 12),
+    ),
+  );
+}
+
+// 急性痛苦/自伤语言。prompt 会先判断，这里在代码层再兜底一次。
+// 命中的 Entry 只做内部标记，不生成可浏览卡片、topics 或 profile facts。
+const ACUTE_DISTRESS_MARKERS = [
+  "想死",
+  "不想活",
+  "活不下去",
+  "自杀",
+  "自尽",
+  "轻生",
+  "了结自己",
+  "结束生命",
+  "去死",
+  "自残",
+  "自伤",
+  "割腕",
+  "跳楼",
+  "绝望",
+];
+
+function containsAcuteDistress(text: string) {
+  const normalized = text.replace(/\s+/g, "");
+  return ACUTE_DISTRESS_MARKERS.some((marker) => normalized.includes(marker));
+}
+
+function buildEntrySourceText(messages: Message[]) {
+  return messages
+    .filter((message) => message.sender === "user")
+    .map((message) => message.content)
+    .join("\n");
+}
+
+function sanitizeCrisisSummary() {
+  return "这段内容被标记为急性痛苦内容。";
+}
+
+function messageOverlapRatio(a: string[], b: string[]) {
+  if (a.length === 0 || b.length === 0) {
+    return 0;
+  }
+
+  const setA = new Set(a);
+  const shared = b.filter((id) => setA.has(id)).length;
+
+  return shared / Math.min(a.length, b.length);
 }
 
 function isExplicitEndSignal(content: string) {
@@ -103,6 +213,141 @@ function getLatestMessageTime(messages: Message[]) {
   );
 }
 
+function inferFallbackCategory(text: string): ExtractedEntry["category"] {
+  if (/吃|喝|海鲜|饭|菜|火锅|烤串|奶茶|咖啡|餐厅|店/.test(text)) {
+    return "美食";
+  }
+
+  if (/健身|减肥|运动|身体|睡|病|疼|医院/.test(text)) {
+    return "健康";
+  }
+
+  if (/妈妈|母亲|爸爸|父亲|姐姐|姐夫|家人|男朋友|女朋友|朋友/.test(text)) {
+    return "人际关系";
+  }
+
+  if (/工作|项目|软件|公司|老板|同事|客户/.test(text)) {
+    return "工作";
+  }
+
+  return "其他";
+}
+
+function inferFallbackKeywords(text: string) {
+  const keywords = [
+    "辣炒海鲜",
+    "海鲜",
+    "火锅",
+    "烤串",
+    "奶茶",
+    "咖啡",
+    "健身",
+    "减肥",
+    "软件项目",
+  ];
+
+  return keywords.filter((keyword) => text.includes(keyword)).slice(0, 5);
+}
+
+function buildFallbackSummary(userMessages: Message[]) {
+  const content = userMessages
+    .slice(-3)
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join("；");
+  const compact = content.replace(/\s+/g, " ").slice(0, 110);
+
+  return compact || "聊到了一件刚发生的小事。";
+}
+
+async function commitFallbackEntry({
+  supabase,
+  userId,
+  messages,
+}: {
+  supabase: ArchiveSupabaseClient;
+  userId: string;
+  messages: Message[];
+}) {
+  const eventMessages = messages
+    .filter((message) => message.user_id === userId)
+    .slice(0, MAX_EVENT_MESSAGES);
+  const userMessages = eventMessages.filter(
+    (message) => message.sender === "user" && !isControlOrFillerMessage(message.content),
+  );
+
+  if (userMessages.length === 0) {
+    await markMessagesArchived({ supabase, userId, messages: eventMessages });
+    return [];
+  }
+
+  const combinedUserText = userMessages.map((message) => message.content).join("\n");
+  const messageIds = eventMessages.map((message) => message.id);
+  const latestTime = new Date(getLatestMessageTime(eventMessages)).toISOString();
+
+  if (containsAcuteDistress(combinedUserText)) {
+    const { data, error } = await supabase
+      .from("entries")
+      .insert({
+        user_id: userId,
+        summary: sanitizeCrisisSummary(),
+        emotion: "低落",
+        emotion_intensity: 1,
+        category: "想法",
+        people: [],
+        places: [],
+        keywords: [],
+        message_ids: messageIds,
+        is_crisis: true,
+        created_at: latestTime,
+      })
+      .select(
+        "id,user_id,summary,emotion,emotion_intensity,category,people,places,keywords,message_ids,is_crisis,created_at,updated_at",
+      )
+      .single();
+
+    await markMessagesArchived({ supabase, userId, messages: eventMessages });
+    console.warn("Archived fallback entry as crisis-only internal record.");
+
+    if (error || !data) {
+      console.error("Could not commit fallback crisis archive entry.", error);
+      return [];
+    }
+
+    return [data as Entry];
+  }
+
+  const summary = buildFallbackSummary(userMessages);
+  const { data, error } = await supabase
+    .from("entries")
+    .insert({
+      user_id: userId,
+      summary,
+      emotion: "平静",
+      emotion_intensity: 0.3,
+      category: inferFallbackCategory(combinedUserText),
+      people: [],
+      places: [],
+      keywords: inferFallbackKeywords(combinedUserText),
+      message_ids: messageIds,
+      is_crisis: false,
+      created_at: latestTime,
+    })
+    .select(
+      "id,user_id,summary,emotion,emotion_intensity,category,people,places,keywords,message_ids,is_crisis,created_at,updated_at",
+    )
+    .single();
+
+  if (error || !data) {
+    console.error("Could not commit fallback archive entry.", error);
+    return null;
+  }
+
+  await markMessagesArchived({ supabase, userId, messages: eventMessages });
+
+  return [data as Entry];
+}
+
 async function createHaikuTextMessage({
   prompt,
   temperature = 0,
@@ -114,7 +359,7 @@ async function createHaikuTextMessage({
   const timeout = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await proxyFetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       signal: controller.signal,
       headers: {
@@ -126,7 +371,7 @@ async function createHaikuTextMessage({
         model:
           process.env.ANTHROPIC_EXTRACTION_MODEL ??
           "claude-haiku-4-5-20251001",
-        max_tokens: 1200,
+        max_tokens: 1800,
         temperature,
         messages: [{ role: "user", content: prompt }],
       }),
@@ -164,14 +409,21 @@ async function createHaikuTextMessage({
 async function getUnarchivedMessages(
   supabase: ArchiveSupabaseClient,
   userId: string,
+  conversationId?: string,
 ) {
-  const { data, error } = await supabase
+  let query = supabase
     .from("messages")
-    .select("id,user_id,sender,content,image_url,created_at")
+    .select("id,user_id,conversation_id,sender,content,image_url,created_at")
     .eq("user_id", userId)
     .is("archived_at", null)
     .order("created_at", { ascending: true })
     .limit(MAX_EVENT_MESSAGES);
+
+  if (conversationId) {
+    query = query.eq("conversation_id", conversationId);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     console.error("Could not load unarchived messages.", error);
@@ -179,6 +431,10 @@ async function getUnarchivedMessages(
   }
 
   return (data ?? []) as Message[];
+}
+
+function getMessageIdSignature(messages: Message[]) {
+  return messages.map((message) => message.id).join(",");
 }
 
 function parseJsonObject(text: string) {
@@ -213,6 +469,48 @@ function isCategory(value: unknown): value is ExtractedEntry["category"] {
   return typeof value === "string" && CATEGORIES.includes(value as never);
 }
 
+function isProfileFactKind(value: unknown): value is RawProfileFact["kind"] {
+  return (
+    typeof value === "string" && PROFILE_FACT_KINDS.includes(value as never)
+  );
+}
+
+function parseProfileFacts(value: unknown, sourceTexts: string[]) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const facts: RawProfileFact[] = [];
+
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    const text = typeof item.text === "string" ? item.text.trim() : "";
+
+    if (!text) {
+      continue;
+    }
+
+    const kind = isProfileFactKind(item.kind) ? item.kind : "other";
+    facts.push({
+      text: text.slice(0, 160),
+      kind,
+      subject:
+        typeof item.subject === "string" && item.subject.trim()
+          ? item.subject.trim().slice(0, 100)
+          : "你",
+      importance:
+        typeof item.importance === "number"
+          ? Math.max(0, Math.min(1, item.importance))
+          : 0.5,
+    });
+  }
+
+  return normalizeProfileFacts(facts, sourceTexts);
+}
+
 function parseBoundaryAction(text: string): BoundaryAction {
   const parsed = parseJsonObject(text);
 
@@ -223,8 +521,14 @@ function parseBoundaryAction(text: string): BoundaryAction {
   return parsed.action === "new_event" ? "new_event" : "continue";
 }
 
-function parseExtractionEntries(text: string): RawExtractedEntry[] {
+function parseExtractionEntries(
+  text: string,
+  sourceMessages: Message[],
+): RawExtractedEntry[] {
   const parsed = parseJsonObject(text);
+  const sourceTexts = sourceMessages
+    .filter((message) => message.sender === "user")
+    .map((message) => message.content);
 
   if (!isRecord(parsed) || !Array.isArray(parsed.entries)) {
     throw new Error("Extraction JSON did not include entries array.");
@@ -240,11 +544,17 @@ function parseExtractionEntries(text: string): RawExtractedEntry[] {
           ? entry.emotion_intensity
           : undefined,
       category: isCategory(entry.category) ? entry.category : undefined,
-      people: asStringArray(entry.people),
+      people: normalizePersonList(asStringArray(entry.people), sourceTexts),
       places: asStringArray(entry.places),
       pets: asStringArray(entry.pets),
       keywords: asStringArray(entry.keywords),
       message_ids: asStringArray(entry.message_ids),
+      // 只按 summary（卡片文字）判定危机：温和措辞的难过事正常保留，
+      // 只有卡片里直接出现"想死/绝望"这类原话才隐藏。不再因聊天原文里出现过就整件隐藏。
+      is_crisis: containsAcuteDistress(
+        typeof entry.summary === "string" ? entry.summary : "",
+      ),
+      profile_facts: parseProfileFacts(entry.profile_facts, sourceTexts),
     }));
 }
 
@@ -281,7 +591,7 @@ async function extractEntryWithHaiku(messages: Message[]) {
         prompt: buildExtractionPrompt(messages),
         temperature: 0,
       });
-      const extractedEntries = parseExtractionEntries(text)
+      const extractedEntries = parseExtractionEntries(text, messages)
         .map((entry) => {
           if (
             !entry.summary ||
@@ -307,26 +617,63 @@ async function extractEntryWithHaiku(messages: Message[]) {
             return null;
           }
 
+          const sourceText = buildEntrySourceText(entryMessages);
+          const isCrisis =
+            entry.is_crisis === true ||
+            containsAcuteDistress(entry.summary) ||
+            containsAcuteDistress(sourceText);
+
           return {
-            summary: entry.summary.trim(),
+            summary: isCrisis ? sanitizeCrisisSummary() : entry.summary.trim(),
             emotion: entry.emotion,
             emotion_intensity: Math.max(0, Math.min(1, entry.emotion_intensity)),
             category: entry.category,
-            people: normalizeList(entry.people ?? []),
-            places: normalizeList(entry.places ?? []),
-            pets: normalizeList(entry.pets ?? []),
-            keywords: normalizeList(entry.keywords ?? []),
+            people: isCrisis ? [] : normalizeList(entry.people ?? []),
+            places: isCrisis ? [] : normalizeList(entry.places ?? []),
+            pets: isCrisis ? [] : normalizeList(entry.pets ?? []),
+            keywords: isCrisis ? [] : normalizeList(entry.keywords ?? []),
             message_ids: messageIds,
+            is_crisis: isCrisis,
+            profile_facts: isCrisis ? [] : (entry.profile_facts ?? []),
             created_at: new Date(getLatestMessageTime(entryMessages)).toISOString(),
           };
         })
-        .filter((entry) => entry !== null);
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 
-      if (extractedEntries.length === 0) {
+      // 模型偶尔把同一个单一话题拆成几乎一样的多条 Entry（重复卡片）。
+      // 同分类且消息高度重叠的合并成一条，保留更完整的 summary。
+      const dedupedEntries: typeof extractedEntries = [];
+
+      for (const entry of extractedEntries) {
+        const duplicate = dedupedEntries.find(
+          (kept) =>
+            kept.category === entry.category &&
+            messageOverlapRatio(kept.message_ids, entry.message_ids) >= 0.5,
+        );
+
+        if (duplicate) {
+          if (entry.is_crisis) {
+            duplicate.is_crisis = true;
+            duplicate.summary = sanitizeCrisisSummary();
+            duplicate.people = [];
+            duplicate.places = [];
+            duplicate.pets = [];
+            duplicate.keywords = [];
+            duplicate.profile_facts = [];
+          } else if (!duplicate.is_crisis && entry.summary.length > duplicate.summary.length) {
+            duplicate.summary = entry.summary;
+          }
+          continue;
+        }
+
+        dedupedEntries.push(entry);
+      }
+
+      if (dedupedEntries.length === 0) {
         console.error("Haiku extraction returned entries, but none referenced substantive user content.");
       }
 
-      return extractedEntries;
+      return dedupedEntries;
     } catch (error) {
       console.error(`Haiku entry extraction failed on attempt ${attempt}.`, error);
     }
@@ -376,7 +723,8 @@ export async function archiveEvent({
     .slice(0, MAX_EVENT_MESSAGES);
 
   if (!eventMessages.some((message) => message.sender === "user")) {
-    return null;
+    await markMessagesArchived({ supabase, userId, messages: eventMessages });
+    return [];
   }
 
   if (!hasSubstantiveUserContent(eventMessages)) {
@@ -388,31 +736,40 @@ export async function archiveEvent({
 
   if (!extraction || extraction.length === 0) {
     console.error("Skipping archive because extraction did not produce valid JSON.");
-    return null;
+    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
   }
 
   const { data, error } = await supabase.rpc("commit_archive_entries", {
     p_user_id: userId,
     p_entries: extraction.map((entry: ExtractedEntry) => ({
-      summary: entry.summary,
+      summary: entry.is_crisis ? sanitizeCrisisSummary() : entry.summary,
       emotion: entry.emotion,
       emotion_intensity: entry.emotion_intensity,
       category: entry.category,
-      people: entry.people,
-      places: entry.places,
-      pets: entry.pets,
-      keywords: entry.keywords,
+      people: entry.is_crisis ? [] : entry.people,
+      places: entry.is_crisis ? [] : entry.places,
+      pets: entry.is_crisis ? [] : entry.pets,
+      keywords: entry.is_crisis ? [] : entry.keywords,
       message_ids: entry.message_ids,
+      is_crisis: entry.is_crisis,
+      profile_facts: entry.is_crisis ? [] : entry.profile_facts,
       created_at: entry.created_at,
     })),
   });
 
   if (error) {
     console.error("Could not commit archive entries transaction.", error);
-    return null;
+    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
   }
 
-  return (data ?? []) as Entry[];
+  const committed = (data ?? []) as Entry[];
+
+  if (committed.length === 0) {
+    console.warn("Archive RPC returned no entries; using fallback entry.");
+    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
+  }
+
+  return committed;
 }
 
 export async function processArchiveAfterTurn({
@@ -426,7 +783,11 @@ export async function processArchiveAfterTurn({
   userMessage: Message;
   assistantMessage: Message;
 }) {
-  const unarchivedMessages = await getUnarchivedMessages(supabase, userId);
+  const unarchivedMessages = await getUnarchivedMessages(
+    supabase,
+    userId,
+    userMessage.conversation_id,
+  );
   const currentTurnIds = new Set([userMessage.id, assistantMessage.id]);
   const previousMessages = unarchivedMessages.filter(
     (message) => !currentTurnIds.has(message.id),
@@ -455,13 +816,76 @@ export async function processArchiveAfterTurn({
 export async function processArchiveNowForUser({
   supabase,
   userId,
+  conversationId,
+  drain = false,
 }: {
   supabase: ArchiveSupabaseClient;
   userId: string;
+  conversationId?: string;
+  drain?: boolean;
 }) {
-  const messages = await getUnarchivedMessages(supabase, userId);
+  if (!drain) {
+    const messages = await getUnarchivedMessages(supabase, userId, conversationId);
 
-  return archiveEvent({ supabase, userId, messages });
+    return archiveEvent({ supabase, userId, messages });
+  }
+
+  const committed: Entry[] = [];
+
+  for (let batch = 0; batch < MAX_DRAIN_ARCHIVE_BATCHES; batch += 1) {
+    const messages = await getUnarchivedMessages(supabase, userId, conversationId);
+
+    if (messages.length === 0) {
+      return committed;
+    }
+
+    const before = getMessageIdSignature(messages);
+    const entries = await archiveEvent({ supabase, userId, messages });
+
+    if (entries) {
+      committed.push(...entries);
+    }
+
+    let remaining = await getUnarchivedMessages(
+      supabase,
+      userId,
+      conversationId,
+    );
+
+    if (remaining.length === 0) {
+      return committed;
+    }
+
+    let remainingSignature = getMessageIdSignature(remaining);
+    let retry = 0;
+
+    while (remainingSignature === before && retry < MAX_DRAIN_STALL_RETRIES) {
+      retry += 1;
+      await new Promise((resolve) => setTimeout(resolve, retry * 500));
+
+      const retryEntries = await archiveEvent({ supabase, userId, messages });
+
+      if (retryEntries) {
+        committed.push(...retryEntries);
+      }
+
+      remaining = await getUnarchivedMessages(supabase, userId, conversationId);
+
+      if (remaining.length === 0) {
+        return committed;
+      }
+
+      remainingSignature = getMessageIdSignature(remaining);
+    }
+
+    if (remainingSignature === before) {
+      throw new Error(
+        "Archive did not make progress; keeping current conversation active.",
+      );
+    }
+  }
+
+  throw new Error("Archive drain reached the batch limit.");
 }
 
 export async function processIdleArchives({

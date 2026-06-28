@@ -31,6 +31,9 @@ const anthropicFetch: typeof globalThis.fetch | undefined = proxyAgent
   : undefined;
 
 const anthropic = createAnthropic({
+  // 必须显式指定 baseURL：ai@6 + @ai-sdk/anthropic@3 的默认值会丢掉 /v1，
+  // 请求会打到 https://api.anthropic.com/messages → 404（回复失败）。
+  baseURL: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com/v1",
   fetch: anthropicFetch,
 });
 
