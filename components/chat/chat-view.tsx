@@ -154,6 +154,12 @@ export function ChatView({
             {isStartingConversation ? "开启中" : "新对话"}
           </button>
           <Link
+            href="/ask"
+            className="rounded-full bg-white px-3 py-1 text-xs font-medium text-neutral-700 ring-1 ring-neutral-200 transition hover:bg-neutral-50"
+          >
+            问问过去
+          </Link>
+          <Link
             href="/archive"
             className="rounded-full bg-white px-3 py-1 text-xs font-medium text-neutral-700 ring-1 ring-neutral-200 transition hover:bg-neutral-50"
           >

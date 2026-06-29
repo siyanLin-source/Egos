@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { proxyFetch } from "@/lib/ai/proxy-fetch";
+import { embedTexts } from "@/lib/ai/embeddings";
 import {
   buildBoundaryPrompt,
   buildExtractionPrompt,
@@ -260,6 +261,39 @@ function buildFallbackSummary(userMessages: Message[]) {
   return compact || "聊到了一件刚发生的小事。";
 }
 
+// 重新确认这批消息是否还没被归档。commit_archive_entries 在"拿不到锁"和
+// "消息已被并发进程归档"两种情况下都返回空集，调用方无法区分；如果直接走兜底
+// 插入，就会和并发进程已写入的正式 Entry 撞成重复卡片。这里在兜底插入前再查一次，
+// 若整批已被别人归档（archived_at 都不为空），就放弃兜底。
+async function getStillUnarchivedIds({
+  supabase,
+  userId,
+  messageIds,
+}: {
+  supabase: ArchiveSupabaseClient;
+  userId: string;
+  messageIds: string[];
+}) {
+  if (messageIds.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await supabase
+    .from("messages")
+    .select("id")
+    .eq("user_id", userId)
+    .is("archived_at", null)
+    .in("id", messageIds);
+
+  if (error) {
+    console.error("Could not re-check archived state before fallback.", error);
+    // 查不动就保守地认为还没归档，让兜底继续，避免漏档。
+    return messageIds;
+  }
+
+  return ((data ?? []) as { id: string }[]).map((row) => row.id);
+}
+
 async function commitFallbackEntry({
   supabase,
   userId,
@@ -281,8 +315,20 @@ async function commitFallbackEntry({
     return [];
   }
 
-  const combinedUserText = userMessages.map((message) => message.content).join("\n");
   const messageIds = eventMessages.map((message) => message.id);
+
+  const stillUnarchived = await getStillUnarchivedIds({
+    supabase,
+    userId,
+    messageIds,
+  });
+
+  if (stillUnarchived.length === 0) {
+    // 整批已被并发归档处理掉了，不再插入兜底卡，避免重复。
+    return [];
+  }
+
+  const combinedUserText = userMessages.map((message) => message.content).join("\n");
   const latestTime = new Date(getLatestMessageTime(eventMessages)).toISOString();
 
   if (containsAcuteDistress(combinedUserText)) {
@@ -709,6 +755,56 @@ async function markMessagesArchived({
   }
 }
 
+// 给刚归档的 entry 算向量并写回（Sprint 2 收尾 / Sprint 3·4 的检索地基）。
+// best-effort：没配 OpenAI key 或失败都不影响归档主流程；危机记录不入向量。
+async function embedEntriesBestEffort(
+  supabase: ArchiveSupabaseClient,
+  userId: string,
+  entries: Entry[] | null,
+) {
+  if (!entries || entries.length === 0) {
+    return;
+  }
+
+  const embeddable = entries.filter(
+    (entry) => !entry.is_crisis && entry.summary.trim(),
+  );
+
+  if (embeddable.length === 0) {
+    return;
+  }
+
+  try {
+    const vectors = await embedTexts(embeddable.map((entry) => entry.summary));
+
+    if (!vectors) {
+      return;
+    }
+
+    await Promise.all(
+      embeddable.map(async (entry, index) => {
+        const embedding = vectors[index];
+
+        if (!embedding) {
+          return;
+        }
+
+        const { error } = await supabase.rpc("set_entry_embedding", {
+          p_user_id: userId,
+          p_entry_id: entry.id,
+          p_embedding: embedding,
+        });
+
+        if (error) {
+          console.error("Could not store entry embedding.", error);
+        }
+      }),
+    );
+  } catch (error) {
+    console.error("Embedding committed entries failed.", error);
+  }
+}
+
 export async function archiveEvent({
   supabase,
   userId,
@@ -736,7 +832,13 @@ export async function archiveEvent({
 
   if (!extraction || extraction.length === 0) {
     console.error("Skipping archive because extraction did not produce valid JSON.");
-    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
+    const fallback = await commitFallbackEntry({
+      supabase,
+      userId,
+      messages: eventMessages,
+    });
+    await embedEntriesBestEffort(supabase, userId, fallback);
+    return fallback;
   }
 
   const { data, error } = await supabase.rpc("commit_archive_entries", {
@@ -759,15 +861,29 @@ export async function archiveEvent({
 
   if (error) {
     console.error("Could not commit archive entries transaction.", error);
-    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
+    const fallback = await commitFallbackEntry({
+      supabase,
+      userId,
+      messages: eventMessages,
+    });
+    await embedEntriesBestEffort(supabase, userId, fallback);
+    return fallback;
   }
 
   const committed = (data ?? []) as Entry[];
 
   if (committed.length === 0) {
     console.warn("Archive RPC returned no entries; using fallback entry.");
-    return commitFallbackEntry({ supabase, userId, messages: eventMessages });
+    const fallback = await commitFallbackEntry({
+      supabase,
+      userId,
+      messages: eventMessages,
+    });
+    await embedEntriesBestEffort(supabase, userId, fallback);
+    return fallback;
   }
+
+  await embedEntriesBestEffort(supabase, userId, committed);
 
   return committed;
 }
