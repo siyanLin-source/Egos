@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --turbopack",
     "dev:clean": "pkill -9 -f \"next dev\" || true; rm -rf .next; npm run dev -- -H 0.0.0.0 -p 3000",
-    "build": "next build",
+    "build": "NODE_ENV=production next build",
     "start": "next start",
     "lint": "eslint"
   },

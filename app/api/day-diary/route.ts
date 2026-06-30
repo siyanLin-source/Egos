@@ -33,6 +33,7 @@ export async function POST(request: Request) {
 要求：
 - 一小段，2-4 句，口语、温和、不堆砌辞藻、不夸张。
 - 不要逐条复述、不要照抄；串成"这一天过得怎么样"的整体感觉。
+- 严格忠于卡片写明的内容：不要脑补卡片没写的细节、原因、因果或情绪，不要把几件事强行编出关联。卡片写到哪就到哪。
 - 跳过没记忆价值的流水账（挪车、搬东西、随便看看这类），别硬塞进去。
 - 只输出这段日记本身，不要标题、不要解释。
 
@@ -41,7 +42,7 @@ ${summaries.map((item) => `- ${item}`).join("\n")}`;
 
   const diary = await completeWithHaiku(prompt, {
     maxTokens: 400,
-    temperature: 0.5,
+    temperature: 0.3,
   });
 
   return NextResponse.json({ diary });
