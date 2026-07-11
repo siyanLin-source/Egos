@@ -36,12 +36,16 @@ export async function GET() {
 
   const { data } = await supabase
     .from("profile_facts")
-    .select("id,kind,subject,text,importance")
+    .select("id,kind,subject,text,fact_key,importance")
     .eq("user_id", claims.sub)
     .order("importance", { ascending: false })
     .limit(20);
 
-  const facts = (data ?? []) as ProfileFact[];
+  // 基本档案卡的 user_edit 行（「你希望 TA 叫你…」等）不是自我介绍素材：
+  // 念进摘要会出现指代不明的「TA」，且和卡片信息重复。
+  const facts = ((data ?? []) as ProfileFact[]).filter(
+    (fact) => !fact.fact_key?.startsWith("user_edit|"),
+  );
 
   if (facts.length === 0) {
     return NextResponse.json({ summary: null });

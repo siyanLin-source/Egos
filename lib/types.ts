@@ -89,4 +89,26 @@ export type ProfileFact = {
   last_observed_at: string;
   created_at: string;
   updated_at: string;
+  // 可选：迁移 0008 起就有 fact_key；source 列由迁移 0013 补充（'extracted' | 'user_edit'）。
+  // 大多数查询不选这两列，所以保持可选。
+  fact_key?: string;
+  source?: string;
+};
+
+export type ReminderStatus = "pending" | "done" | "dismissed";
+
+export type ReminderSource = "chat" | "manual";
+
+export type Reminder = {
+  id: string;
+  user_id: string;
+  title: string;
+  due_at: string;
+  location: string | null;
+  notes: string | null;
+  status: ReminderStatus;
+  source: ReminderSource;
+  source_conversation_id: string | null;
+  created_at: string;
+  completed_at: string | null;
 };

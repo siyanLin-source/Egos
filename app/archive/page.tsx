@@ -29,7 +29,7 @@ export default async function ArchivePage() {
       supabase
         .from("profile_facts")
         .select(
-          "id,user_id,kind,subject,text,importance,pinned,source_entry_id,source_message_ids,first_observed_at,last_observed_at,created_at,updated_at",
+          "id,user_id,kind,subject,text,fact_key,importance,pinned,source_entry_id,source_message_ids,first_observed_at,last_observed_at,created_at,updated_at",
         )
         .eq("user_id", claims.sub)
         .order("importance", { ascending: false })
