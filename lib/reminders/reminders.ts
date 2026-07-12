@@ -114,6 +114,24 @@ export async function createReminder({
     };
   }
 
+  // 幂等：同标题、到期时间相差一分钟内的 pending 已存在时直接返回它。
+  // 真机观察到模型会在下一轮把上一轮已建的提醒再建一次（消息历史里的
+  // 工具调用轨迹不完整时尤其如此），服务端兜底防重。
+  const { data: duplicate } = await supabase
+    .from("reminders")
+    .select(REMINDER_COLUMNS)
+    .eq("user_id", userId)
+    .eq("status", "pending")
+    .eq("title", title)
+    .gte("due_at", new Date(dueAt.getTime() - 60_000).toISOString())
+    .lte("due_at", new Date(dueAt.getTime() + 60_000).toISOString())
+    .limit(1)
+    .maybeSingle();
+
+  if (duplicate) {
+    return { ok: true, reminder: duplicate as Reminder };
+  }
+
   const { data, error } = await supabase
     .from("reminders")
     .insert({
