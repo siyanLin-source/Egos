@@ -3,9 +3,11 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
+import { BasicProfileCard } from "@/components/archive/basic-profile-card";
 import { Button } from "@/components/ui/button";
 import { cleanEntries } from "@/lib/archive/clean-entries";
 import { canonicalPersonName } from "@/lib/archive/people";
+import { getPreferredNickname } from "@/lib/profile/basic-profile";
 import { CATEGORIES, EMOTIONS } from "@/lib/archive/taxonomy";
 import type {
   Entry,
@@ -603,8 +605,17 @@ export function ArchiveView({
     () => facts.filter((fact) => fact.pinned),
     [facts],
   );
-  const profileName = useMemo(() => getProfileName(facts), [facts]);
-  const profileSummary = useMemo(() => buildProfileSummary(facts), [facts]);
+  // 基本档案卡写入的 user_edit 行（「你的生日是…」「你希望 TA 叫你…」）
+  // 不能进名字推导/本地摘要，否则画像卡会把生日当成名字。
+  const aiFacts = useMemo(
+    () => facts.filter((fact) => !fact.fact_key?.startsWith("user_edit|")),
+    [facts],
+  );
+  const profileName = useMemo(
+    () => getPreferredNickname(facts) ?? getProfileName(aiFacts),
+    [facts, aiFacts],
+  );
+  const profileSummary = useMemo(() => buildProfileSummary(aiFacts), [aiFacts]);
   // AI 写的「关于你」那句话。加载完成前先用本地模板兜底，避免空白。
   const [aiSummary, setAiSummary] = useState<string | null>(null);
 
@@ -759,6 +770,11 @@ export function ArchiveView({
               清除
             </button>
           ) : null}
+        </div>
+
+        {/* CSS 隐藏而不是卸载：搜索时卸载会丢掉编辑到一半的内容 */}
+        <div className={isSearching ? "hidden" : undefined}>
+          <BasicProfileCard />
         </div>
 
         {!isSearching && pinnedFacts.length > 0 ? (
